@@ -29,6 +29,7 @@ from backend.common.models import Job, Task, WorkerRecord
 from backend.common.storage import Storage
 from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
+from backend.master.lineage import LineageStore
 from backend.master.metrics import Metrics
 from backend.master.registry import WorkerRegistry
 from backend.master.shuffle import ShuffleCoordinator
@@ -48,6 +49,7 @@ class Scheduler:
         metrics: Metrics,
         config,
         logbus: LogBus,
+        lineage: Optional[LineageStore] = None,
     ) -> None:
         self.storage = storage
         self.job_manager = job_manager
@@ -57,6 +59,8 @@ class Scheduler:
         self.metrics = metrics
         self.config = config
         self.logbus = logbus
+        # May be wired in right after construction (Master wires the two sides).
+        self.lineage = lineage
         self.client = HttpClient(timeout=3.0, retries=1)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -178,6 +182,15 @@ class Scheduler:
     def _dispatch(self, job: Job, task: Task, worker: WorkerRecord,
                   speculative: bool = False) -> None:
         spec = self._build_spec(job, task)
+        # Every dispatch (retry, reassignment or speculative duplicate) is a
+        # distinct execution attempt and gets its own lineage node.  The attempt
+        # number is 1-based for human display / worker fault injection; the seq
+        # disambiguates two executions sharing the same retry counter.
+        exec_seq = self.lineage.next_seq(task.task_id) if self.lineage else 0
+        attempt_no = task.attempts + 1
+        spec["attempt"] = attempt_no - 1
+        spec["attempt_no"] = attempt_no
+        spec["exec_seq"] = exec_seq
         if speculative:
             spec["speculative"] = True
         url = f"{worker.address}/task/execute"
@@ -191,9 +204,11 @@ class Scheduler:
         if not accepted:
             return
 
+        dispatched_ms = now_ms()
+
         def mark_dispatched(t: Task) -> None:
             t.status = C.TASK_ASSIGNED
-            t.assigned_ms = now_ms()
+            t.assigned_ms = dispatched_ms
             if not speculative:
                 t.worker_id = worker.worker_id
             else:
@@ -202,6 +217,15 @@ class Scheduler:
                 t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        if self.lineage:
+            self.lineage.record_exec(
+                job.job_id, task.task_id, exec_seq, attempt_no,
+                worker_id=worker.worker_id, kind=task.kind,
+                speculative=speculative, status=C.TASK_ASSIGNED,
+                dispatched_ms=dispatched_ms,
+                input_shard=task.input_shard,
+                partition=task.partition if task.kind == C.TASK_REDUCE else -1,
+            )
         self.logbus.info(
             job.job_id,
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
@@ -262,9 +286,16 @@ class Scheduler:
 
         worker_id = payload.get("worker_id", "")
         status = payload.get("status", C.TASK_FAILED)
+        exec_seq = int(payload.get("exec_seq", 0) or 0)
+        attempt_no = int(payload.get("attempt", 0) or 0) + 1
 
         if status != C.TASK_SUCCEEDED:
             self.registry.task_finished(worker_id, success=False)
+            if self.lineage and exec_seq:
+                self.lineage.mark_exec_failed(
+                    job.job_id, task.task_id, exec_seq, attempt_no,
+                    payload.get("error", ""),
+                )
             self.fault_tolerance.handle_task_failure(job, task, payload.get("error", ""), worker_id)
             return
 
@@ -279,16 +310,41 @@ class Scheduler:
             t.error = ""
             stats = dict(t.stats or {})
             stats["partition_size_entries"] = payload.get("partition_sizes", {})
+            # Keep partition key contributions on the task as well (cheap JSON).
+            stats["partition_keys"] = payload.get("partition_keys", {})
+            stats["source_counts"] = payload.get("source_counts", {})
             stats["results"] = payload.get("results", [])
             stats["winning_worker"] = worker_id
+            stats["winning_seq"] = exec_seq
             t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
         self.registry.task_finished(worker_id, success=True)
         self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
 
+        # Lineage: the winning execution + stage provenance document.
+        if self.lineage and exec_seq:
+            self.lineage.record_exec(
+                job.job_id, task.task_id, exec_seq, attempt_no,
+                worker_id=worker_id, kind=task.kind,
+                speculative=bool(payload.get("speculative", False)),
+                status=C.TASK_SUCCEEDED,
+                started_ms=task.started_ms, finished_ms=task.finished_ms,
+                records_processed=int(payload.get("records_processed", 0)),
+                records_emitted=int(payload.get("records_emitted", 0)),
+                input_shard=task.input_shard,
+                partition=task.partition if task.kind == C.TASK_REDUCE else -1,
+            )
+            if task.kind == C.TASK_MAP:
+                self.lineage.record_map_output(job.job_id, task, payload, exec_seq, attempt_no)
+
         if task.kind == C.TASK_REDUCE:
             self._store_results(job, task, payload.get("results", []))
+            if self.lineage and exec_seq:
+                fetch_plan = (task.stats or {}).get("fetch_plan", [])
+                self.lineage.record_reduce_input(
+                    job.job_id, task, payload, fetch_plan, exec_seq, attempt_no,
+                )
             self.shuffle.mark_partition_done(job, task.partition,
                                              task.stats.get("shuffle_bytes", 0))
 
@@ -326,6 +382,27 @@ class Scheduler:
                                      {"task_id": task.task_id}, timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
+        if self.lineage:
+            # The winner is known; every other still-open attempt lost the race.
+            winning_seq = int((task.stats or {}).get("winning_seq", 0) or 0)
+            for exe in self.lineage.executions(job.job_id, task.task_id):
+                if exe.get("seq") == winning_seq or exe.get("status") in (
+                        C.TASK_SUCCEEDED, "failed", "speculative_lost", "worker_lost"):
+                    continue
+                self.lineage.record_exec(
+                    job.job_id, task.task_id, exe["seq"], exe.get("attempt", 1),
+                    worker_id=exe.get("worker_id", ""), kind=task.kind,
+                    speculative=bool(exe.get("speculative")),
+                    status="speculative_lost",
+                    error=f"lost speculative race; winner on {winner_worker_id}",
+                    dispatched_ms=exe.get("dispatched_ms", 0),
+                    started_ms=exe.get("started_ms", 0),
+                    finished_ms=now_ms(),
+                    records_processed=exe.get("records_processed", 0),
+                    records_emitted=exe.get("records_emitted", 0),
+                    input_shard=task.input_shard,
+                    partition=task.partition if task.kind == C.TASK_REDUCE else -1,
+                )
 
     # ------------------------------------------------------------------
     def _finish_success(self, job: Job) -> None:

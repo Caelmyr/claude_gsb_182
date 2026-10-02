@@ -23,6 +23,7 @@ from backend.common.models import Job
 from backend.common.storage import Storage, list_files, read_json
 from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
+from backend.master.lineage import LineageStore
 from backend.master.metrics import Metrics
 from backend.master.registry import WorkerRegistry
 from backend.master.scheduler import Scheduler
@@ -50,10 +51,13 @@ class Master:
         self.metrics = Metrics(self.storage)
         self.shuffle = ShuffleCoordinator(self.storage, self.job_manager, self.registry, self.logbus)
         self.fault_tolerance = FaultTolerance(self.storage, self.job_manager, self.config, self.logbus)
+        self.lineage = LineageStore(self.storage, self.job_manager, self.registry)
+        self.fault_tolerance.lineage = self.lineage
         self.registry.on_death = self.fault_tolerance.handle_worker_death
         self.scheduler = Scheduler(
             self.storage, self.job_manager, self.registry, self.shuffle,
             self.fault_tolerance, self.metrics, self.config, self.logbus,
+            lineage=self.lineage,
         )
 
         self.app = Flask("master", static_folder=FRONTEND_DIR, static_url_path="")
@@ -89,6 +93,9 @@ class Master:
         app.add_url_rule("/api/jobs/<job_id>/results", "job_results", self._job_results, methods=["GET"])
         app.add_url_rule("/api/jobs/<job_id>/results/download", "job_results_download",
                          self._job_results_download, methods=["GET"])
+        app.add_url_rule("/api/jobs/<job_id>/lineage", "job_lineage", self._job_lineage, methods=["GET"])
+        app.add_url_rule("/api/jobs/<job_id>/lineage/task/<task_id>", "job_lineage_task",
+                         self._job_lineage_task, methods=["GET"])
         app.add_url_rule("/api/workers", "workers", self._workers, methods=["GET"])
         app.add_url_rule("/api/workers/<worker_id>/metrics", "worker_metrics", self._worker_metrics, methods=["GET"])
         app.add_url_rule("/api/cluster/metrics", "cluster_metrics", self._cluster_metrics, methods=["GET"])
@@ -130,7 +137,15 @@ class Master:
         for path in list_files(root, suffix=".json"):
             doc = read_json(path)
             if doc:
+                pname = doc.get("partition_name", "")
                 for rec in doc.get("records", []):
+                    # Annotate with the partition this record physically landed
+                    # in, so a result row carries the lineage query coordinates.
+                    if isinstance(rec, dict):
+                        rec = dict(rec)
+                        rec.setdefault("_partition", doc.get("partition", 0))
+                        rec.setdefault("_partition_name", pname)
+                        rec.setdefault("_reduce_task_id", doc.get("task_id", ""))
                     records.append(rec)
         return records
 
@@ -271,16 +286,45 @@ class Master:
             "job_id": job_id,
             "status": job.status,
             "partitions": self._result_partitions(job),
+            "lineage": self.lineage.summary(job_id),
             "total": len(records),
             "records": records[:limit],
             "truncated": len(records) > limit,
         })
 
+    def _job_lineage(self, job_id: str):
+        job, err, code = self._get_job(job_id)
+        if job is None:
+            return err, code
+        key = request.args.get("key", "")
+        partition_raw = request.args.get("partition", "")
+        partition = None
+        if partition_raw != "":
+            try:
+                partition = int(partition_raw)
+            except ValueError:
+                return jsonify({"error": "partition must be an integer"}), 400
+        trace = self.lineage.trace_result(job_id, key=key, partition=partition)
+        return jsonify(trace)
+
+    def _job_lineage_task(self, job_id: str, task_id: str):
+        job, err, code = self._get_job(job_id)
+        if job is None:
+            return err, code
+        task = self.job_manager.get_task(job_id, task_id)
+        if task is None:
+            return jsonify({"error": f"unknown task {task_id}"}), 404
+        index = self.lineage._fault_index(job_id)  # noqa: SLF001 - same-package view
+        view = self.lineage._attempt_view(job_id, task_id, index.get(task_id, []))  # noqa: SLF001
+        return jsonify({"job_id": job_id, "task": view})
+
     def _job_results_download(self, job_id: str):
         job, err, code = self._get_job(job_id)
         if job is None:
             return err, code
-        records = self._read_results(job)
+        # Strip internal lineage-coordinate annotations before exporting.
+        records = [{k: v for k, v in r.items() if not k.startswith("_")}
+                   if isinstance(r, dict) else r for r in self._read_results(job)]
         fmt = request.args.get("format", "json").lower()
         if fmt == "csv":
             return self._as_csv(job, records)

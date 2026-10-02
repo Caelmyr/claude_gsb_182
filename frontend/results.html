@@ -23,7 +23,18 @@
     <div class="stat-tiles" id="stats"></div>
     <div class="grid cols-2 mt">
       <div class="card"><h2>结果分区 <span class="sub">Partitions</span></h2><div id="partitions"></div></div>
-      <div class="card"><h2>结果预览 <span class="sub">Preview</span></h2><div id="preview"></div></div>
+      <div class="card"><h2>结果预览 <span class="sub">Preview — 点击任意行追溯血缘</span></h2><div id="preview"></div></div>
+    </div>
+
+    <div class="card mt">
+      <h2>数据血缘追溯 <span class="sub">Result Lineage — 输入分片 → Map → Shuffle → Reduce → 分区</span></h2>
+      <div class="flex mb" style="flex-wrap:wrap">
+        <input id="lineage-key" class="input" type="text" placeholder="输入结果 Key 追溯 trace by key…" style="min-width:260px">
+        <button class="btn primary small" id="lineage-go">追溯 Trace</button>
+        <select id="lineage-partition" class="input" style="min-width:180px"></select>
+        <span class="muted small" id="lineage-hint"></span>
+      </div>
+      <div id="lineage"></div>
     </div>
   </main>
   <script src="js/api.js"></script>

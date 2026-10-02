@@ -52,6 +52,10 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
 
     total = max(1, len(records))
     buffers: dict[int, list[tuple[Any, Any]]] = {}
+    # Lineage: per-partition {key: occurrence count} for the records this task
+    # actually emitted — the exact contribution set used to trace a result key
+    # back to this input shard (rather than inferring it from the hash alone).
+    partition_keys: dict[int, dict[Any, int]] = {}
     processed = 0
     emitted = 0
     chunk_size = 200
@@ -61,6 +65,8 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
         for key, value in mapper(chunk, params):
             p = partition_for(key, num_partitions)
             buffers.setdefault(p, []).append((key, value))
+            keymap = partition_keys.setdefault(p, {})
+            keymap[key] = keymap.get(key, 0) + 1
             emitted += 1
         processed += len(chunk)
 
@@ -80,6 +86,8 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
         "records_processed": processed,
         "records_emitted": emitted,
         "partition_sizes": {k: v // 1024 for k, v in store.partition_sizes(job_id, task_id).items()},
+        "partition_keys": {str(p): {str(k): n for k, n in keys.items()}
+                           for p, keys in partition_keys.items()},
     }
 
 
@@ -99,6 +107,9 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
 
     fetched = 0
     total_sources = max(1, len(fetch_plan))
+    # Lineage: how many pairs each map task actually contributed to the merged
+    # input of this (successful) reduce attempt.
+    source_counts: dict[str, int] = {}
     for idx, src in enumerate(fetch_plan):
         url = (
             f"{src['worker_url']}/shuffle/{job_id}/{src['map_task_id']}/"
@@ -109,11 +120,14 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             raise RuntimeError(
                 f"shuffle fetch failed for partition {partition} from {url}"
             )
+        n_from_source = 0
         if isinstance(pairs, list):
             for rec in pairs:
                 if isinstance(rec, (list, tuple)) and len(rec) >= 2:
                     sorter.add(rec[0], rec[1])
                     fetched += 1
+                    n_from_source += 1
+        source_counts[src["map_task_id"]] = n_from_source
         progress_cb(min(1.0, (idx + 1) / total_sources), fetched, 0)
 
     # Group the externally-sorted stream by key and run the reducer per group.
@@ -128,7 +142,9 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
             values = [value]
         else:
             values.append(value)
-    if prev_key is not None and len(results) < 0:
+    # Flush the final group (the previous branch only ever fires on a *change*
+    # of key, so the last sorted group would otherwise be silently dropped).
+    if prev_key is not None:
         results.append(reducer(prev_key, values, params))
 
     return {
@@ -136,13 +152,16 @@ def _run_reduce(spec: dict, progress_cb: ProgressCallback) -> dict:
         "records_emitted": len(results),
         "results": results,
         "partition": partition,
+        "source_counts": source_counts,
     }
 
 
 def _execute_task(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
     # Fault injection: when a job opts in, the first attempt of every task raises
     # so the fault-recovery path (retry -> reassign) is exercised end to end.
-    if spec.get("simulate_failure"):
+    # Only the zero-based first attempt fails; retries succeed, which is what
+    # makes the retry trail observable (and the job completable).
+    if spec.get("simulate_failure") and int(spec.get("attempt", 0)) == 0:
         raise RuntimeError("simulated failure for fault-injection demo (attempt 0)")
     if spec.get("kind") == C.TASK_MAP:
         return _run_map(spec, data_root, progress_cb)
@@ -333,10 +352,15 @@ class Executor:
             "task_id": task_id,
             "kind": spec.get("kind", ""),
             "status": result.get("status", C.TASK_FAILED),
+            "attempt": int(spec.get("attempt", 0)),
+            "exec_seq": int(spec.get("exec_seq", 0)),
+            "speculative": bool(spec.get("speculative", False)),
             "records_processed": result.get("records_processed", 0),
             "records_emitted": result.get("records_emitted", 0),
             "duration_ms": int((now_ms() - handle["started_ms"]) / 1000) if handle else 0,
             "partition_sizes": result.get("partition_sizes", {}),
+            "partition_keys": result.get("partition_keys", {}),
+            "source_counts": result.get("source_counts", {}),
             "results": result.get("results", []),
             "error": result.get("error", ""),
         })

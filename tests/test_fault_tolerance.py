@@ -12,7 +12,7 @@ from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
 from backend.tasks.registry import get_reducer
 from backend.tasks.samples import generate_input_records
-from backend.worker.executor import _run_map
+from backend.worker.executor import _run_map, _run_reduce
 from backend.worker.shuffle_store import ShuffleStore
 
 
@@ -80,7 +80,44 @@ class TestMapReduceCorrectness(unittest.TestCase):
         reducer = get_reducer("count_reducer")
         result = {k: reducer(k, vs, {})["count"] for k, vs in grouped.items()}
         self.assertEqual(dict(result), dict(reference))
+        # Every distinct word must be present (guards against dropping the final
+        # sorted group in the reducer).
+        self.assertEqual(set(result), set(reference))
         shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reduce_emits_last_group(self):
+        # The final sorted key group must not be dropped.
+        from backend.worker import executor as ex
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                self.timeout = 0
+                self.retries = 0
+
+            def get_json(self, url, default=None):
+                if "m-0000" in url:
+                    return [["only", 1], ["only", 1]]
+                return [["only", 1]]
+
+        orig = ex.HttpClient
+        ex.HttpClient = FakeClient
+        try:
+            tmp = tempfile.mkdtemp()
+            spec = {
+                "task_id": "r-0000", "job_id": "job", "kind": "reduce",
+                "reducer": "count_reducer", "params": {}, "partition": 0,
+                "fetch_plan": [
+                    {"worker_url": "http://x", "map_task_id": "m-0000"},
+                    {"worker_url": "http://x", "map_task_id": "m-0001"},
+                ],
+                "spill_records": 100, "tmp_dir": tmp,
+            }
+            out = _run_reduce(spec, lambda p, a, b: None)
+            self.assertEqual(len(out["results"]), 1)
+            self.assertEqual(out["results"][0], {"key": "only", "count": 3})
+            shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            ex.HttpClient = orig
 
 
 if __name__ == "__main__":

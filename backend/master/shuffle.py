@@ -55,14 +55,18 @@ class ShuffleCoordinator:
             sources: list[dict] = []
             total_bytes = 0
             for mt in map_tasks:
-                worker = self.registry.get(mt.worker_id or "")
+                # Prefer the worker that actually produced the winning output
+                # (a speculative copy may win on a different node); fall back to
+                # the task's assigned worker.
+                winning_worker_id = (mt.stats or {}).get("winning_worker") or mt.worker_id or ""
+                worker = self.registry.get(winning_worker_id)
                 if worker is None:
                     continue
                 sizes = (mt.stats or {}).get("partition_sizes", {}) or {}
                 byte_count = int(sizes.get(f"{pname}.jsonl", 0))
                 sources.append({
                     "map_task_id": mt.task_id,
-                    "worker_id": mt.worker_id,
+                    "worker_id": winning_worker_id,
                     "worker_url": worker.address,
                     "bytes": byte_count,
                 })
@@ -84,7 +88,11 @@ class ShuffleCoordinator:
 
             # Attach the fetch plan to the reduce task.
             fetch_plan = [
-                {"worker_url": s["worker_url"], "map_task_id": s["map_task_id"]}
+                {
+                    "worker_url": s["worker_url"],
+                    "worker_id": s["worker_id"],
+                    "map_task_id": s["map_task_id"],
+                }
                 for s in sources
             ]
             rt.stats["fetch_plan"] = fetch_plan

@@ -34,11 +34,16 @@ class FaultTolerance:
         job_manager: JobManager,
         config,
         logbus: LogBus,
+        lineage=None,
     ) -> None:
         self.storage = storage
         self.job_manager = job_manager
         self.config = config
         self.logbus = logbus
+        # Wired in by the Master after construction; used to stamp open lineage
+        # attempts as "worker_lost" so a reassignment never leaves a dangling
+        # node in the chain.
+        self.lineage = lineage
 
     # ------------------------------------------------------------------
     def _record(self, job: Job, kind: str, message: str, task: Optional[Task] = None,
@@ -104,6 +109,27 @@ class FaultTolerance:
                         f"worker {worker.name} lost; reassigning task {task.task_id}",
                         task=task, worker_id=worker.worker_id,
                     )
+                    if self.lineage is not None:
+                        # Close every open attempt on the dead node in the chain.
+                        for exe in self.lineage.executions(job.job_id, task.task_id):
+                            if (exe.get("worker_id") == worker.worker_id
+                                    and exe.get("status") in
+                                    (C.TASK_ASSIGNED, C.TASK_RUNNING, C.TASK_PENDING)):
+                                self.lineage.record_exec(
+                                    job.job_id, task.task_id, exe["seq"],
+                                    exe.get("attempt", task.attempts),
+                                    worker_id=worker.worker_id, kind=task.kind,
+                                    speculative=bool(exe.get("speculative")),
+                                    status="worker_lost",
+                                    error=f"worker {worker.name} died; task reassigned",
+                                    dispatched_ms=exe.get("dispatched_ms", 0),
+                                    started_ms=exe.get("started_ms", 0),
+                                    finished_ms=now_ms(),
+                                    records_processed=exe.get("records_processed", 0),
+                                    records_emitted=exe.get("records_emitted", 0),
+                                    input_shard=task.input_shard,
+                                    partition=task.partition if task.kind == C.TASK_REDUCE else -1,
+                                )
                     self.job_manager.update_task(
                         job.job_id, task.task_id,
                         status=C.TASK_RETRYING, worker_id=None,

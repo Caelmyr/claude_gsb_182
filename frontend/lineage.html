@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>数据血缘 Lineage — 分布式 MapReduce</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header id="app-nav"></header>
+  <main class="page">
+    <h1 class="page-title">结果数据血缘 <span>Result Data Lineage</span></h1>
+    <p class="page-desc">
+      针对任意一条结果，回溯它来自哪些<b>输入分片</b>、经过哪些 <b>Map / Shuffle / Reduce 执行任务</b>、落在哪个<b>最终分区</b>；
+      任务重试、节点改派、推测执行、多源合并都会完整保留在链路中。
+      Trace any output record back to its input shards, task attempts (incl. retries &amp; speculation), shuffle merge and result partition.
+    </p>
+
+    <div class="flex between mb" style="gap:12px;flex-wrap:wrap">
+      <div id="job-picker" style="min-width:280px"></div>
+      <div class="flex" style="gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="partition-select" class="job-select" style="min-width:170px"></select>
+        <input id="key-input" class="job-select" list="key-list" style="min-width:220px" placeholder="结果 Key（可留空）Result key…">
+        <datalist id="key-list"></datalist>
+        <button class="btn primary small" id="trace-btn">追踪 Trace</button>
+      </div>
+    </div>
+
+    <div class="stat-tiles" id="stats"></div>
+
+    <div id="notfound" class="card" style="display:none;margin-top:12px"></div>
+
+    <h2 class="mt">完整血缘链路 <span class="muted small">End-to-end lineage chain</span></h2>
+    <div class="card">
+      <div class="lineage-chain" id="chain"></div>
+    </div>
+
+    <div class="grid cols-2 mt">
+      <div class="card">
+        <h2>Shuffle 合并明细 <span class="sub">Merge segments</span></h2>
+        <div id="segments"></div>
+      </div>
+      <div class="card">
+        <h2>任务尝试时间线 <span class="sub">Attempt timeline (retries / speculation)</span></h2>
+        <div id="timeline"></div>
+      </div>
+    </div>
+
+    <div class="card mt">
+      <h2>结果分区与 Key <span class="sub">Result partitions &amp; keys</span></h2>
+      <div id="partition-keys"></div>
+    </div>
+  </main>
+  <script src="js/api.js"></script>
+  <script src="js/components.js"></script>
+  <script src="js/pages/lineage.js"></script>
+</body>
+</html>

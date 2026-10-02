@@ -39,6 +39,23 @@ TASK_ACTIVE_STATES = {TASK_ASSIGNED, TASK_RUNNING, TASK_RETRYING}
 TASK_TERMINAL_STATES = {TASK_SUCCEEDED, TASK_FAILED}
 
 # ---------------------------------------------------------------------------
+# Task-attempt states (a single logical task may execute several attempts,
+# across different workers, because of retries / reassignments / speculation;
+# the data-lineage graph keeps one node per attempt so retries never break the
+# chain).
+# ---------------------------------------------------------------------------
+ATTEMPT_ASSIGNED = "assigned"     # dispatched, worker has not acknowledged yet
+ATTEMPT_RUNNING = "running"      # worker reported progress
+ATTEMPT_SUCCEEDED = "succeeded"  # produced the output the job actually used
+ATTEMPT_FAILED = "failed"        # raised / reported an error
+ATTEMPT_LOST = "lost"            # its worker died mid-flight; superseded
+ATTEMPT_CANCELLED = "cancelled"  # speculative loser cancelled after a winner
+ATTEMPT_STATES = (
+    ATTEMPT_ASSIGNED, ATTEMPT_RUNNING, ATTEMPT_SUCCEEDED,
+    ATTEMPT_FAILED, ATTEMPT_LOST, ATTEMPT_CANCELLED,
+)
+
+# ---------------------------------------------------------------------------
 # Stage names (also used as directory names in the JSON store)
 # ---------------------------------------------------------------------------
 STAGE_INPUT = "input"

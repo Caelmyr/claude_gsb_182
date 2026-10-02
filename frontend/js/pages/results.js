@@ -32,6 +32,12 @@ async function render() {
     ? C.table([
         { key: 'key', label: 'Key', render: r => `<b>${C.esc(r.key)}</b>` },
         { key: 'value', label: 'Value', render: r => C.valueCell(r) },
+        { key: '_lineage', label: '血缘 Lineage', render: r => {
+            const p = r._partition_name || r._partition || '';
+            const href = `lineage.html?job=${encodeURIComponent(currentJob)}` +
+              `&partition=${encodeURIComponent(p)}&key=${encodeURIComponent(r.key)}`;
+            return `<a class="btn small" href="${href}">追踪 Trace →</a>`;
+        } },
       ], records)
     : C.empty('暂无结果 No results');
 }

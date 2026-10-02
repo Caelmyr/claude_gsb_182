@@ -104,6 +104,7 @@ class Scheduler:
             map_tasks = self.job_manager.tasks_for(job.job_id, C.TASK_MAP)
             if map_tasks and all(t.status == C.TASK_SUCCEEDED for t in map_tasks):
                 self.shuffle.build(job)
+                self.job_manager.lineage.record_shuffle(job)
                 self.job_manager.apply_job(job.job_id, lambda j: (
                     setattr(j, "status", C.JOB_SHUFFLE),
                     j.stats.__setitem__("shuffle_started_ms", now_ms()),
@@ -202,6 +203,9 @@ class Scheduler:
                 t.stats = stats
 
         self.job_manager.apply_task(job.job_id, task.task_id, mark_dispatched)
+        self.job_manager.lineage.record_dispatch(
+            job, task, worker.worker_id, speculative=speculative,
+        )
         self.logbus.info(
             job.job_id,
             f"task {task.task_id} dispatched to {worker.name}" + (" (speculative)" if speculative else ""),
@@ -251,6 +255,9 @@ class Scheduler:
             t.records_emitted = int(payload.get("records_emitted", t.records_emitted))
 
         self.job_manager.apply_task(job.job_id, task.task_id, apply)
+        self.job_manager.lineage.record_running(
+            job.job_id, task.task_id, payload.get("worker_id", ""),
+        )
 
     def on_task_complete(self, payload: dict) -> None:
         job = self.job_manager.get_job(payload.get("job_id", ""))
@@ -265,6 +272,7 @@ class Scheduler:
 
         if status != C.TASK_SUCCEEDED:
             self.registry.task_finished(worker_id, success=False)
+            self.job_manager.lineage.record_failure(job, task, worker_id, payload.get("error", ""))
             self.fault_tolerance.handle_task_failure(job, task, payload.get("error", ""), worker_id)
             return
 
@@ -288,9 +296,12 @@ class Scheduler:
         self.metrics.record_task(job, task, int(payload.get("duration_ms", 0)))
 
         if task.kind == C.TASK_REDUCE:
+            self.job_manager.lineage.record_reduce_success(job, task, worker_id, payload)
             self._store_results(job, task, payload.get("results", []))
             self.shuffle.mark_partition_done(job, task.partition,
                                              task.stats.get("shuffle_bytes", 0))
+        else:
+            self.job_manager.lineage.record_map_success(job, task, worker_id, payload)
 
         self.logbus.info(
             job.job_id,

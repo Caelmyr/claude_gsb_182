@@ -49,7 +49,10 @@ class Master:
         self.registry = WorkerRegistry(self.storage, self.config)
         self.metrics = Metrics(self.storage)
         self.shuffle = ShuffleCoordinator(self.storage, self.job_manager, self.registry, self.logbus)
-        self.fault_tolerance = FaultTolerance(self.storage, self.job_manager, self.config, self.logbus)
+        self.fault_tolerance = FaultTolerance(
+            self.storage, self.job_manager, self.config, self.logbus,
+            lineage=self.job_manager.lineage,
+        )
         self.registry.on_death = self.fault_tolerance.handle_worker_death
         self.scheduler = Scheduler(
             self.storage, self.job_manager, self.registry, self.shuffle,
@@ -89,6 +92,7 @@ class Master:
         app.add_url_rule("/api/jobs/<job_id>/results", "job_results", self._job_results, methods=["GET"])
         app.add_url_rule("/api/jobs/<job_id>/results/download", "job_results_download",
                          self._job_results_download, methods=["GET"])
+        app.add_url_rule("/api/jobs/<job_id>/lineage", "job_lineage", self._job_lineage, methods=["GET"])
         app.add_url_rule("/api/workers", "workers", self._workers, methods=["GET"])
         app.add_url_rule("/api/workers/<worker_id>/metrics", "worker_metrics", self._worker_metrics, methods=["GET"])
         app.add_url_rule("/api/cluster/metrics", "cluster_metrics", self._cluster_metrics, methods=["GET"])
@@ -130,7 +134,15 @@ class Master:
         for path in list_files(root, suffix=".json"):
             doc = read_json(path)
             if doc:
+                partition = doc.get("partition")
+                partition_name_ = doc.get("partition_name")
+                reduce_task_id = doc.get("task_id")
                 for rec in doc.get("records", []):
+                    if isinstance(rec, dict):
+                        # Provenance coordinates — kept out of exports below.
+                        rec["_partition"] = partition
+                        rec["_partition_name"] = partition_name_
+                        rec["_reduce_task_id"] = reduce_task_id
                     records.append(rec)
         return records
 
@@ -281,6 +293,9 @@ class Master:
         if job is None:
             return err, code
         records = self._read_results(job)
+        # Strip internal provenance coordinates before export.
+        records = [{k: v for k, v in r.items() if not k.startswith("_")}
+                   if isinstance(r, dict) else r for r in records]
         fmt = request.args.get("format", "json").lower()
         if fmt == "csv":
             return self._as_csv(job, records)
@@ -291,11 +306,32 @@ class Master:
             headers={"Content-Disposition": f"attachment; filename={job_id}.json"},
         )
 
+    def _job_lineage(self, job_id: str):
+        job, err, code = self._get_job(job_id)
+        if job is None:
+            return err, code
+        # GET /lineage            -> overview (result partitions + keys)
+        # GET /lineage/trace?partition=..&key=.. -> full provenance chain
+        if request.args.get("trace") or "partition" in request.args or "key" in request.args:
+            data = self.job_manager.lineage.trace(
+                job_id,
+                partition=request.args.get("partition", ""),
+                key=request.args.get("key", ""),
+                registry=self.registry,
+            )
+            return jsonify(data)
+        data = self.job_manager.lineage.result_overview(job_id, registry=self.registry)
+        data["job_id"] = job_id
+        data["status"] = job.status
+        data["num_input_shards"] = len(job.map_task_ids)
+        data["num_reduce_tasks"] = job.num_reduce_tasks
+        return jsonify(data)
+
     def _as_csv(self, job: Job, records: list[dict]) -> Response:
         fieldnames: list[str] = []
         for rec in records[:50]:
             for key in rec.keys():
-                if key != "key" and key not in fieldnames:
+                if key != "key" and not key.startswith("_") and key not in fieldnames:
                     fieldnames.append(key)
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")

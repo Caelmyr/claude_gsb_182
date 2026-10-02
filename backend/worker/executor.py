@@ -52,6 +52,13 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
 
     total = max(1, len(records))
     buffers: dict[int, list[tuple[Any, Any]]] = {}
+    # Lineage fingerprint: the distinct keys this task emits into each reduce
+    # partition, bounded so a huge/fan-out task cannot blow up memory.  Once a
+    # partition exceeds the cap it is flagged ``truncated`` and the trace marks
+    # that segment as "may contain the key" instead of a definitive yes/no.
+    lineage_cap = max(100, int(spec.get("lineage_key_cap", 5000)))
+    lineage_keys: dict[int, set] = {p: set() for p in range(num_partitions)}
+    lineage_truncated: dict[int, bool] = {}
     processed = 0
     emitted = 0
     chunk_size = 200
@@ -62,6 +69,11 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
             p = partition_for(key, num_partitions)
             buffers.setdefault(p, []).append((key, value))
             emitted += 1
+            key_set = lineage_keys.setdefault(p, set())
+            if len(key_set) < lineage_cap:
+                key_set.add(key)
+            elif key not in key_set:
+                lineage_truncated[p] = True
         processed += len(chunk)
 
         # Spill a partition's buffer to disk once it outgrows the threshold so
@@ -76,10 +88,22 @@ def _run_map(spec: dict, data_root: str, progress_cb: ProgressCallback) -> dict:
         if buf:
             store.append_partition(job_id, task_id, p, buf)
 
+    # Report one fingerprint per non-empty partition (name matches the shuffle
+    # files reducers fetch: ``part-XXXX``).
+    partition_lineage: dict[str, dict] = {}
+    for p, key_set in lineage_keys.items():
+        if not key_set and not lineage_truncated.get(p):
+            continue
+        partition_lineage[partition_filename(p)] = {
+            "keys": sorted(key_set, key=str),
+            "truncated": bool(lineage_truncated.get(p, False)),
+        }
+
     return {
         "records_processed": processed,
         "records_emitted": emitted,
         "partition_sizes": {k: v // 1024 for k, v in store.partition_sizes(job_id, task_id).items()},
+        "partition_lineage": partition_lineage,
     }
 
 
@@ -337,6 +361,7 @@ class Executor:
             "records_emitted": result.get("records_emitted", 0),
             "duration_ms": int((now_ms() - handle["started_ms"]) / 1000) if handle else 0,
             "partition_sizes": result.get("partition_sizes", {}),
+            "partition_lineage": result.get("partition_lineage", {}),
             "results": result.get("results", []),
             "error": result.get("error", ""),
         })

@@ -34,11 +34,13 @@ class FaultTolerance:
         job_manager: JobManager,
         config,
         logbus: LogBus,
+        lineage=None,
     ) -> None:
         self.storage = storage
         self.job_manager = job_manager
         self.config = config
         self.logbus = logbus
+        self.lineage = lineage
 
     # ------------------------------------------------------------------
     def _record(self, job: Job, kind: str, message: str, task: Optional[Task] = None,
@@ -104,6 +106,11 @@ class FaultTolerance:
                         f"worker {worker.name} lost; reassigning task {task.task_id}",
                         task=task, worker_id=worker.worker_id,
                     )
+                    if self.lineage is not None:
+                        self.lineage.record_worker_lost(
+                            job.job_id, task.task_id, worker.worker_id,
+                            reason=f"worker {worker.name} died",
+                        )
                     self.job_manager.update_task(
                         job.job_id, task.task_id,
                         status=C.TASK_RETRYING, worker_id=None,

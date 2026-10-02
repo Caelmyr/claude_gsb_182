@@ -56,6 +56,7 @@ class ShardPlanner:
         chunks = split_evenly(records, num_map)
 
         input_shards: list[str] = []
+        input_shard_meta: list[dict] = []
         for i, chunk in enumerate(chunks):
             sid = shard_id("in", i)
             self.storage.write({
@@ -68,12 +69,14 @@ class ShardPlanner:
                 "created_ms": now_ms(),
             }, "jobs", job.job_id, "shards", C.STAGE_INPUT, f"{sid}.json")
             input_shards.append(sid)
+            input_shard_meta.append({"shard_id": sid, "index": i, "count": len(chunk)})
 
         map_tasks = [new_task(job, C.TASK_MAP, i) for i in range(num_map)]
         reduce_tasks = [new_task(job, C.TASK_REDUCE, p) for p in range(job.num_reduce_tasks)]
 
         return {
             "input_shards": input_shards,
+            "input_shard_meta": input_shard_meta,
             "map_tasks": map_tasks,
             "reduce_tasks": reduce_tasks,
             "total_records": len(records) + 1,

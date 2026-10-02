@@ -10,6 +10,7 @@ const Components = (() => {
     { key: 'logs', href: 'logs.html', label: '日志搜索 Logs' },
     { key: 'metrics', href: 'metrics.html', label: '性能指标 Metrics' },
     { key: 'fault', href: 'fault.html', label: '故障恢复 Fault' },
+    { key: 'lineage', href: 'lineage.html', label: '数据血缘 Lineage' },
     { key: 'config', href: 'config.html', label: '配置管理 Config' },
     { key: 'results', href: 'results.html', label: '结果导出 Results' },
   ];
@@ -171,15 +172,17 @@ const Components = (() => {
 
   function valueCell(rec) {
     // Render a result record generically: key -> value / values.
-    const keys = Object.keys(rec).filter(k => k !== 'key');
+    const keys = Object.keys(rec).filter(k => k !== 'key' && !k.startsWith('_'));
     if (keys.length === 1) return esc(rec[keys[0]]);
     return esc(keys.map(k => `${k}=${rec[k]}`).join(', '));
   }
 
-  // Build a job <select> in hostId once, auto-select the first job.
-  function jobPicker(hostId, onSelect) {
+  // Build a job <select> in hostId once, auto-select the first job (or the
+  // job given in opts.value, used by deep links from other pages).
+  function jobPicker(hostId, onSelect, opts) {
     const host = document.getElementById(hostId);
     if (!host) return;
+    opts = opts || {};
     API.get('/api/jobs').then(d => {
       const jobs = d.jobs || [];
       let html = '<select class="job-select"><option value="">选择作业 Select job…</option>';
@@ -187,8 +190,10 @@ const Components = (() => {
       html += '</select>';
       host.innerHTML = html;
       const sel = host.querySelector('select');
+      const preferred = opts.value && jobs.some(j => j.job_id === opts.value) ? opts.value : '';
       sel.addEventListener('change', () => onSelect(sel.value));
-      if (jobs.length) { sel.value = jobs[0].job_id; onSelect(sel.value); }
+      if (preferred) { sel.value = preferred; onSelect(sel.value); }
+      else if (jobs.length) { sel.value = jobs[0].job_id; onSelect(sel.value); }
     }).catch(() => { host.innerHTML = empty('无法连接 Master (Cannot reach master)'); });
   }
 

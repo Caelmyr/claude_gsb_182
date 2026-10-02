@@ -21,6 +21,7 @@ from backend.common.logbus import LogBus
 from backend.common.models import Job, Task, new_job
 from backend.common.storage import Storage, list_files, list_subdirs, read_json
 from backend.master.shard_planner import ShardPlanner
+from backend.master.lineage import LineageTracker
 from backend.tasks.registry import has_mapper, has_reducer
 from backend.tasks.samples import input_kind_for
 
@@ -31,6 +32,7 @@ class JobManager:
         self.config = config
         self.logbus = logbus
         self.planner = ShardPlanner(storage, config)
+        self.lineage = LineageTracker(storage)
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, dict[str, Task]] = {}
         self._lock = threading.RLock()
@@ -103,6 +105,8 @@ class JobManager:
                 self._tasks[job.job_id][task.task_id] = task
                 self.save_task(job.job_id, task)
             self.save_job(job)
+            # Seed the data-lineage graph with the actual shard/task layout.
+            self.lineage.init_job(job, plan)
 
         self.logbus.info(
             job.job_id, f"job submitted: {job.num_map_tasks} map / {job.num_reduce_tasks} reduce, "
